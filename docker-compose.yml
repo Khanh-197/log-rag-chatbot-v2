@@ -1,0 +1,54 @@
+version: '3'
+
+services:
+  llm-server:
+    image: ollama/ollama:latest
+    container_name: llm-server
+    ports:
+      - "11434:11434"
+    volumes:
+      - ollama-data:/root/.ollama
+    restart: unless-stopped
+    env_file:
+      - .env
+    networks:
+      - rag-network
+
+  vector-db:
+    image: chromadb/chroma:latest
+    container_name: vector-db
+    ports:
+      - "8000:8000"
+    volumes:
+      - chroma-data:/chroma/data
+    restart: unless-stopped
+    env_file:
+      - .env
+    networks:
+      - rag-network
+
+  rag-app:
+    build:
+      context: ./app
+      dockerfile: Dockerfile
+    container_name: rag-app
+    ports:
+      - "8501:8501"
+    depends_on:
+      - llm-server
+      - vector-db
+    volumes:
+      - ./app:/app
+    env_file:
+      - .env
+    restart: unless-stopped
+    networks:
+      - rag-network
+
+networks:
+  rag-network:
+    driver: bridge
+
+volumes:
+  ollama-data:
+  chroma-data:

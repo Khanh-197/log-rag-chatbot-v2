@@ -1,0 +1,148 @@
+import os
+import chromadb
+from chromadb.config import Settings
+from sentence_transformers import SentenceTransformer
+import logging
+import requests
+from dotenv import load_dotenv
+
+load_dotenv()
+
+logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
+logger = logging.getLogger(__name__)
+
+class VectorStore:
+    def __init__(self):
+        self.chroma_host = os.getenv("CHROMA_HOST")
+        self.chroma_port = os.getenv("CHROMA_PORT")
+        self.chroma_tenant = os.getenv("CHROMA_TENANT", "default_tenant")
+        self.chroma_database = os.getenv("CHROMA_DATABASE", "default_database")
+        self.collection_name = os.getenv("CHROMA_COLLECTION")
+        self.embedding_model_name = os.getenv("EMBEDDING_MODEL", "all-MiniLM-L6-v2")
+
+        self.client = self._connect()
+        self.collection = self._get_or_create_collection()
+        self.embedding_model = SentenceTransformer(self.embedding_model_name)
+
+    def _connect(self):
+        """Connect to ChromaDB."""
+        try:
+            logger.info(f"Attempting to connect to ChromaDB at {self.chroma_host}:{self.chroma_port}")
+
+            # Check if ChromaDB v2 API is up
+            try:
+                response = requests.get(f"http://{self.chroma_host}:{self.chroma_port}/api/v2/heartbeat")
+                logger.info(f"ChromaDB v2 heartbeat response: {response.status_code}")
+            except Exception as ping_error:
+                logger.error(f"Could not ping ChromaDB v2 API: {ping_error}")
+
+            # Connect using proper v2 Settings
+            settings = Settings(
+                chroma_api_impl="rest",
+                chroma_server_host=self.chroma_host,
+                chroma_server_http_port=int(self.chroma_port),
+                tenant=self.chroma_tenant,
+                database=self.chroma_database,
+                allow_reset=True,
+                anonymized_telemetry=False
+            )
+
+            client = chromadb.HttpClient(settings)
+            logger.info("Successfully created ChromaDB client")
+            return client
+        except Exception as e:
+            logger.error(f"Error connecting to ChromaDB: {e}")
+            logger.error(f"Exception type: {type(e).__name__}")
+            return None
+
+    def _get_or_create_collection(self):
+        """Get or create a collection in ChromaDB."""
+        if not self.client:
+            logger.error("ChromaDB client not connected")
+            return None
+
+        try:
+            collections = self.client.list_collections()
+            collection_names = [c.name for c in collections]
+
+            if self.collection_name in collection_names:
+                collection = self.client.get_collection(self.collection_name)
+                logger.info(f"Using existing collection: {self.collection_name}")
+            else:
+                collection = self.client.create_collection(self.collection_name)
+                logger.info(f"Created new collection: {self.collection_name}")
+
+            return collection
+        except Exception as e:
+            logger.error(f"Error getting or creating collection: {e}")
+            return None
+
+    def generate_embedding(self, text):
+        """Generate embedding for a text."""
+        return self.embedding_model.encode(text).tolist()
+
+    def _log_to_text(self, log):
+        """Convert a log dict to a text representation."""
+        text_parts = []
+        priority_fields = ["message", "log", "details", "transid", "@timestamp"]
+
+        for field in priority_fields:
+            if field in log and log[field]:
+                text_parts.append(f"{field}: {log[field]}")
+
+        for key, value in log.items():
+            if key not in priority_fields and value:
+                text_parts.append(f"{key}: {value}")
+
+        return "\n".join(text_parts)
+
+    def add_logs(self, logs):
+        """Add logs to the vector store."""
+        if not self.collection:
+            logger.error("ChromaDB collection not available")
+            return
+
+        try:
+            ids = []
+            documents = []
+            metadatas = []
+
+            for log in logs:
+                log_id = log.get("_id", str(hash(frozenset(log.items()))))
+                ids.append(log_id)
+
+                log_text = self._log_to_text(log)
+                documents.append(log_text)
+
+                # sanitize metadata
+                sanitized_log = {
+                    k: (v if isinstance(v, (str, int, float, bool, list, dict)) or v is None else str(v))
+                    for k, v in log.items()
+                }
+                metadatas.append(sanitized_log)
+
+            self.collection.add(
+                ids=ids,
+                documents=documents,
+                metadatas=metadatas
+            )
+            logger.info(f"Added {len(logs)} logs to vector store")
+        except Exception as e:
+            logger.error(f"Error adding logs to vector store: {e}")
+
+    def query_similar(self, query_text, n_results=5):
+        """Query for similar logs."""
+        if not self.collection:
+            logger.error("ChromaDB collection not available")
+            return []
+
+        try:
+            results = self.collection.query(
+                query_texts=[query_text],
+                n_results=n_results
+            )
+            return results.get("metadatas", [[]])[0]
+        except Exception as e:
+            logger.error(f"Error querying vector store: {e}")
+            return []
+
